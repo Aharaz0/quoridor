@@ -118,7 +118,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);
 #gapp{width:100%;height:100%;display:flex;flex-direction:column;}
 .panel{flex-shrink:0;display:flex;flex-direction:column;
   align-items:center;justify-content:center;gap:3px;padding:3px 8px;}
-#panel2{transform:rotate(180deg);}
+#panel2{ /* rotation applied via JS based on mode */ }
 #cw{flex:1;min-height:0;display:flex;align-items:center;
   justify-content:center;overflow:hidden;padding:2px;position:relative;}
 canvas{display:block;touch-action:none;border-radius:10px;
@@ -163,13 +163,7 @@ canvas{display:block;touch-action:none;border-radius:10px;
 .cb:active{transform:scale(.92);}
 .cb.ok{background:var(--ok);color:#fff;} .cb.cl{background:var(--err);color:#fff;}
 
-/* waiting overlay */
-#waiting-overlay{display:none;position:absolute;inset:0;
-  background:rgba(9,14,26,.88);border-radius:10px;
-  align-items:center;justify-content:center;flex-direction:column;gap:10px;
-  z-index:40;}
-#waiting-overlay.show{display:flex;}
-.waiting-text{color:var(--muted);font-size:.88em;font-weight:700;}
+/* online turn indicator handled via badge only */
 
 #ai-thinking{display:none;position:absolute;top:50%;left:50%;
   transform:translate(-50%,-50%);background:rgba(10,15,26,.92);
@@ -454,13 +448,7 @@ canvas{display:block;touch-action:none;border-radius:10px;
 
     <div id="cw">
       <canvas id="board"></canvas>
-      <div id="waiting-overlay">
-        <div style="animation:spin 1.2s linear infinite;">
-          <svg class="ico ico-lg" style="color:var(--gold);"><use href="#sym-gear"/></svg>
-        </div>
-        <div class="waiting-text" id="waitingText">في انتظار الخصم...</div>
-      </div>
-      <div id="ai-thinking">
+      <div id="ai-thinking" style="display:none;">
         <svg class="ico" style="animation:spin 1s linear infinite;color:var(--gold);"><use href="#sym-gear"/></svg>
         <span>الذكاء يفكر...</span>
       </div>
@@ -789,11 +777,8 @@ function applyOnlineState(state) {
   G.lastMove= state.lastMove || null;
   G.pend    = null;
   lastIntent= null;
-
-  hideWaitingOverlay();
   uiUpdate();
   repaintAll();
-
   if(G.over) showWin();
 }
 
@@ -803,10 +788,10 @@ function isMyTurn() {
 }
 
 function showWaitingOverlay() {
-  document.getElementById('waiting-overlay').classList.add('show');
+  // No overlay — just handled via badge in uiUpdate
 }
 function hideWaitingOverlay() {
-  document.getElementById('waiting-overlay').classList.remove('show');
+  // No overlay — just handled via badge in uiUpdate
 }
 
 async function restartOnlineGame() {
@@ -857,15 +842,31 @@ function initGame(cfg) {
   document.getElementById('wb2').style.display = showP2Btns ? '' : 'none';
   document.getElementById('undobtn2').style.display = showP2Btns ? '' : 'none';
 
-  // Online: hide undo for both (fairness)
+  // Panel2 rotation: only in local (same-device) modes
+  const p2 = document.getElementById('panel2');
+  const gapp = document.getElementById('gapp');
+  if(ONLINE.active) {
+    // Online: no rotation — each player holds their own phone normally
+    p2.style.transform = 'none';
+    // Player 2 online: show their panel at bottom, opponent at top
+    if(ONLINE.myPlayer === 2) {
+      // Swap panels: put panel1 (opponent/blue) at top, panel2 (me/orange) at bottom
+      gapp.style.flexDirection = 'column-reverse';
+    } else {
+      gapp.style.flexDirection = 'column';
+    }
+  } else {
+    // Local: rotate panel2 (it's the top player holding phone upside down)
+    p2.style.transform = 'rotate(180deg)';
+    gapp.style.flexDirection = 'column';
+  }
+
+  // ai-thinking: only for bot mode
+  document.getElementById('ai-thinking').style.display='none';
   if(ONLINE.active) {
     document.getElementById('undobtn1').style.display = 'none';
     document.getElementById('undobtn2').style.display = 'none';
   }
-
-  // Online waiting state
-  if(ONLINE.active && G.cur !== ONLINE.myPlayer) showWaitingOverlay();
-  else hideWaitingOverlay();
 
   resize(); uiUpdate(); repaintAll();
   if(IS_BOT && startPlayer===2) scheduleBot();
@@ -1062,6 +1063,14 @@ function drawArrowCtx(ctx,x1,y1,x2,y2,color){
 function repaintAll(){
   const sz=cv.width;
   cx.clearRect(0,0,sz,sz);
+
+  // Online player 2: flip canvas so their goal (row N-1) appears at bottom
+  const flipBoard = ONLINE.active && ONLINE.myPlayer === 2;
+  if(flipBoard){
+    cx.save();
+    cx.translate(sz, sz);
+    cx.rotate(Math.PI);
+  }
   const bg=cx.createLinearGradient(0,0,sz,sz);
   bg.addColorStop(0,'#0d1f10');bg.addColorStop(1,'#071208');
   cx.fillStyle=bg;cx.fillRect(0,0,sz,sz);
@@ -1169,6 +1178,8 @@ function repaintAll(){
   // pawns
   drawPawn(G.pos[1],'#38bdf8','#0369a1','1');
   drawPawn(G.pos[2],'#f97316','#c2410c','2');
+
+  if(flipBoard) cx.restore();
 }
 
 function drawWall(type,r,c,owner){
@@ -1209,51 +1220,53 @@ function drawPawn(p,light,dark,lbl){
 function uiUpdate(){
   const{cur,wLeft,over,winner,mode,pend}=G;
   const b1=document.getElementById('bdg1'),b2=document.getElementById('bdg2');
+
   if(over){
     b1.className=b2.className='badge win';
     b1.textContent=winner===1?'فائز!':'';
     b2.textContent=winner===2?'فائز!':'';
+  } else if(ONLINE.active){
+    // Online: show whose turn simply without dimming
+    const myP=ONLINE.myPlayer;
+    const myTurn=isMyTurn();
+    b1.className='badge'+(cur===1?' t1':'');
+    b1.textContent=cur===1?(myP===1?'دورك ✨':'انتظر...'):'انتظر';
+    b2.className='badge'+(cur===2?' t2':'');
+    b2.textContent=cur===2?(myP===2?'دورك ✨':'انتظر...'):'انتظر';
   } else {
     b1.className='badge'+(cur===1?' t1':'');
     b1.textContent=cur===1?'دورك':'انتظر';
     b2.className='badge'+(cur===2?(IS_BOT?' ai':' t2'):'');
     b2.textContent=cur===2?(IS_BOT?'يفكر...':'دورك'):'انتظر';
-    // Online override
-    if(ONLINE.active){
-      const myTurn=isMyTurn();
-      b1.textContent=cur===1?(myTurn?'دورك':'انتظر الخصم'):'انتظر';
-      b2.textContent=cur===2?(myTurn?'دورك':'انتظر الخصم'):'انتظر';
-    }
   }
+
   document.getElementById('card1').className='card c1'+(cur===1&&!over?' g1':'');
   document.getElementById('card2').className='card c2'+(cur===2&&!over?' g2':'');
   renderDots('dots1',wLeft[1],'d1');
   renderDots('dots2',wLeft[2],'d2');
 
-  const myTurn = isMyTurn();
-  const d1=over||cur!==1||(ONLINE.active&&ONLINE.myPlayer!==1)||(!ONLINE.active&&false);
-  const d2=over||cur!==2||IS_BOT||(ONLINE.active&&ONLINE.myPlayer!==2);
+  // Button disabled states
+  // Online: only my player's buttons active on my turn
+  const d1 = over || cur!==1 || (ONLINE.active && ONLINE.myPlayer!==1);
+  const d2 = over || cur!==2 || IS_BOT || (ONLINE.active && ONLINE.myPlayer!==2);
   setBtn('mb1','on1',mode[1]==='move'&&!d1,d1);
   setBtn('wb1','on1',mode[1]==='wall'&&!d1,d1||wLeft[1]===0);
   if(!IS_BOT){
     setBtn('mb2','on2',mode[2]==='move'&&!d2,d2);
     setBtn('wb2','on2',mode[2]==='wall'&&!d2,d2||wLeft[2]===0);
   }
+
   const hasH=G.history.length>0&&!ONLINE.active;
   const u1=document.getElementById('undobtn1');
   const u2=document.getElementById('undobtn2');
   if(u1) u1.className='btn sm'+(hasH&&!over?'':' off');
   if(u2) u2.className='btn sm'+(hasH&&!over?'':' off');
 
-  // confirm buttons: only show for current player if it's their turn
-  const canAct1 = !!pend&&cur===1&&(!ONLINE.active||(ONLINE.active&&ONLINE.myPlayer===1));
-  const canAct2 = !!pend&&cur===2&&!IS_BOT&&(!ONLINE.active||(ONLINE.active&&ONLINE.myPlayer===2));
+  // Confirm buttons
+  const canAct1=!!pend&&cur===1&&(!ONLINE.active||(ONLINE.active&&ONLINE.myPlayer===1));
+  const canAct2=!!pend&&cur===2&&!IS_BOT&&(!ONLINE.active||(ONLINE.active&&ONLINE.myPlayer===2));
   show('ok1',canAct1);show('cl1',canAct1);
   show('ok2',canAct2);show('cl2',canAct2);
-
-  // Online waiting overlay
-  if(ONLINE.active && !over && !isMyTurn()) showWaitingOverlay();
-  else hideWaitingOverlay();
 }
 
 function setBtn(id,on,isOn,isOff){
@@ -1357,7 +1370,10 @@ function handle(ex,ey){
   const pl=G.cur;
   const rect=cv.getBoundingClientRect();
   const sx=cv.width/rect.width,sy=cv.height/rect.height;
-  const tx=(ex-rect.left)*sx-MG,ty=(ey-rect.top)*sy-MG;
+  let tx=(ex-rect.left)*sx-MG;
+  let ty=(ey-rect.top)*sy-MG;
+  // Online player 2 sees board rotated 180° — invert tap coords to match game coordinates
+  if(ONLINE.active && ONLINE.myPlayer===2){ tx=BP-tx; ty=BP-ty; }
   const fc=Math.floor(tx/CS),fr=Math.floor(ty/CS);
   const distCell=Math.hypot(tx-(fc+.5)*CS,ty-(fr+.5)*CS);
   const cellValid=fc>=0&&fc<N&&fr>=0&&fr<N;
