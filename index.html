@@ -1208,11 +1208,43 @@ const FB = {
     await fetch(`${FIREBASE_URL}/${path}.json`,{method:'DELETE'}).catch(()=>{});
   },
   listen(path,cb){
-    const es=new EventSource(`${FIREBASE_URL}/${path}.json`);
-    es.addEventListener('put',e=>{ try{const d=JSON.parse(e.data);cb(d.data||null);}catch(e){} });
-    es.addEventListener('patch',e=>{ try{const d=JSON.parse(e.data);cb(d.data||null);}catch(e){} });
-    es.addEventListener('error',()=>{ /* reconnects automatically */ });
-    return es;
+    let es = null;
+    let reconnectTimeout = null;
+    let closed = false;
+    let retryDelay = 1500;
+
+    function connect() {
+      if (closed) return;
+      if (es) { try { es.close(); } catch(e){} }
+
+      es = new EventSource(`${FIREBASE_URL}/${path}.json`);
+
+      es.addEventListener('put', e => {
+        try { retryDelay = 1500; const d=JSON.parse(e.data); cb(d.data||null); } catch(e){}
+      });
+      es.addEventListener('patch', e => {
+        try { retryDelay = 1500; const d=JSON.parse(e.data); cb(d.data||null); } catch(e){}
+      });
+      es.onerror = () => {
+        if (closed) return;
+        console.warn(`EventSource error on ${path}, retry in ${retryDelay}ms`);
+        try { es.close(); } catch(e){} es = null;
+        if (reconnectTimeout) clearTimeout(reconnectTimeout);
+        reconnectTimeout = setTimeout(() => {
+          retryDelay = Math.min(retryDelay * 1.5, 10000);
+          connect();
+        }, retryDelay);
+      };
+    }
+
+    connect();
+    return {
+      close: () => {
+        closed = true;
+        if (reconnectTimeout) { clearTimeout(reconnectTimeout); reconnectTimeout = null; }
+        if (es) { try { es.close(); } catch(e){} es = null; }
+      }
+    };
   }
 };
 
@@ -2729,28 +2761,37 @@ function getAbilityName(ability) {
   };
   return names[ability] || ability;
 }async function cleanupFirebase() {
-  // 1. تنظيف room-list من الغرف غير الموجودة أو المنتهية
-  const roomList = await FB.get('room-list');
+  // جلب الـ room-list والـ rooms بالتوازي دفعة واحدة
+  const [roomList, rooms] = await Promise.all([
+    FB.get('room-list'),
+    FB.get('rooms')
+  ]);
+
+  const deletes = [];
+  const now = Date.now();
+
+  // 1. تنظيف room-list من الغرف غير الموجودة أو المكتملة
   if (roomList) {
     for (const code in roomList) {
-      const room = await FB.get(`rooms/${code}`);
+      const room = rooms ? rooms[code] : null;
       if (!room || room.status !== 'waiting') {
-        await FB.delete(`room-list/${code}`).catch(()=>{});
+        deletes.push(FB.delete(`room-list/${code}`).catch(()=>{}));
       }
     }
   }
-  
-  // 2. حذف الغرف القديمة (أكثر من دقيقتين)
-  const rooms = await FB.get('rooms');
+
+  // 2. حذف الغرف القديمة (أكثر من دقيقتين) — بالتوازي
   if (rooms) {
-    const now = Date.now();
     for (const code in rooms) {
-      if (rooms[code].created && (now - rooms[code].created) > 120000) { // دقيقتين
-        await FB.delete(`rooms/${code}`).catch(()=>{});
-        await FB.delete(`room-list/${code}`).catch(()=>{});
+      if (rooms[code].created && (now - rooms[code].created) > 120000) {
+        deletes.push(FB.delete(`rooms/${code}`).catch(()=>{}));
+        deletes.push(FB.delete(`room-list/${code}`).catch(()=>{}));
       }
     }
   }
+
+  // كل الحذف بالتوازي دفعة واحدة
+  await Promise.all(deletes);
 }
 async function joinFromList(code) {
   // [OK] نفس الفحص ولكن مع رسالة مختلفة
@@ -2826,8 +2867,16 @@ function showRoomsList() {
   document.getElementById('lobbyRoomsList').style.display = '';
   refreshRoomsList();
 }
+let _lastAppliedTs = 0;
+
 function applyOnlineState(state) {
-  if (!state || G.over) return;
+  if (!state || !ONLINE.active || G.over) return;
+  // Guard ضد الـ state القديم أو المتأخر
+  if (state._ts && state._ts < _lastAppliedTs) {
+    console.warn('Ignoring stale state, ts:', state._ts);
+    return;
+  }
+  if (state._ts) _lastAppliedTs = state._ts;
 
   G.cur = state.cur;
   G.pos = state.pos;
@@ -2890,9 +2939,11 @@ function applyOnlineState(state) {
   }
 }
 async function refreshRoomsList() {
-  await cleanupFirebase(); // تنظيف قبل العرض
+  // عرض القائمة فوراً بدون انتظار الـ cleanup
   const rooms = await fetchAvailableRooms();
   renderAvailableRooms(rooms);
+  // cleanup في الخلفية بعد العرض (لا يعطّل الـ UI)
+  cleanupFirebase().catch(()=>{});
 }
 async function createRoom() {
   const nameInput = document.getElementById('roomNameInput');
@@ -3010,7 +3061,9 @@ function cancelLobby() {
     FB.delete(`room-list/${ONLINE.roomCode}`).catch(()=>{});
   }
   
-  ONLINE = { active: false, myPlayer: 0, roomCode: '', listener: null };
+  if(ONLINE.disconnectListener){ONLINE.disconnectListener.close();ONLINE.disconnectListener=null;}
+  if(ONLINE.abilityListener){ONLINE.abilityListener.close();ONLINE.abilityListener=null;}
+  ONLINE = { active: false, myPlayer: 0, roomCode: '', listener: null, disconnectListener: null, abilityListener: null };
   showScreen('menu');
   
   // تنظيف عام بعد الخروج
@@ -3056,6 +3109,10 @@ function cleanupOnline(){
 function startOnlineGame(code, myPlayer, size, gmode, ability, timePerPlayer) {
   FB.delete(`room-list/${code}`).catch(()=>{});
 
+  // Cleanup أي listeners قديمة أولاً
+  cleanupOnline();
+  _lastAppliedTs = 0;
+
   ONLINE.active = true;
   ONLINE.myPlayer = myPlayer;
   ONLINE.roomCode = code;
@@ -3076,27 +3133,29 @@ function startOnlineGame(code, myPlayer, size, gmode, ability, timePerPlayer) {
 
   initGame(CFG);
 
+  // Listener مستقل للـ gameState — مش متداخل مع أي حاجة تانية
   ONLINE.listener = FB.listen(`rooms/${code}/gameState`, state => {
-    if (!state || G.over) return;
+    if (!state || !ONLINE.active || G.over) return;
     if (state._by === myPlayer) return;
-ONLINE.disconnectListener = FB.listen(`rooms/${code}/disconnect`, (val) => {
-  if (val && !G.over && val.player !== ONLINE.myPlayer) {
-    // الخصم انسحب
-    G.over = true;
-    G.winner = ONLINE.myPlayer;
-    showWin();        // استخدم الـ win overlay الموجود
-    showToast('<svg class="ico"><use href="#s-x"/></svg> الخصم انسحب! فزت تلقائياً', 'error');
-    stopGameTimer();
-    // حذف الغرفة من Firebase
-    FB.delete(`rooms/${code}`).catch(()=>{});
-    FB.delete(`room-list/${code}`).catch(()=>{});
-  }
-});
     applyOnlineState(state);
   });
 
-  // بس اللاعب اللي دوره يبدأ التايمر
+  // Listener مستقل للـ disconnect — خارج الـ gameState callback تماماً
+  ONLINE.disconnectListener = FB.listen(`rooms/${code}/disconnect`, (val) => {
+    if (!val || !ONLINE.active) return;
+    if (val.player === ONLINE.myPlayer) return;
+    if (!G.over) {
+      G.over = true;
+      G.winner = ONLINE.myPlayer;
+      showWin();
+      showToast('<svg class="ico"><use href="#s-x"/></svg> الخصم انسحب! فزت تلقائياً', 'error');
+      stopGameTimer();
+      FB.delete(`rooms/${code}`).catch(()=>{});
+      FB.delete(`room-list/${code}`).catch(()=>{});
+    }
+  });
 
+  // بس اللاعب اللي دوره يبدأ التايمر
   if (myPlayer === 1) {
     // Player1 يبعت الحالة الأولى عشان اللاعب 2 يعرف مين يبدأ والـ timeLeft
     pushGameState();
@@ -3202,11 +3261,16 @@ async function pushGameState() {
   };
   
   
-await FB.update(`rooms/${ONLINE.roomCode}`, { 
-  gameState: state,
-  updatedBy: ONLINE.myPlayer,     // ← مهم جداً
-  lastUpdated: Date.now()
-});
+try {
+    await FB.update(`rooms/${ONLINE.roomCode}`, { 
+      gameState: state,
+      updatedBy: ONLINE.myPlayer,
+      lastUpdated: Date.now()
+    });
+  } catch(err) {
+    console.error('pushGameState failed:', err);
+    showToast('⚠️ فشل إرسال الحركة، حاول تاني', 'warn');
+  }
 }
 function startPlayerTimer() {
   stopPlayerTimer();
